@@ -1,0 +1,455 @@
+name: Falix Auto Start
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [falix-start]
+
+jobs:
+  start-server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: |
+          npm init -y
+          npm install playwright-core
+
+      - name: Install Chrome
+        run: |
+          # 安装真实 Chrome（用于 CDP 绕过 Cloudflare）
+          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
+          echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
+          sudo apt-get update -qq
+          sudo apt-get install -y google-chrome-stable
+
+      - name: Run Falix Auto Start
+        env:
+          FALIX_EMAIL: ${{ secrets.FALIX_EMAIL }}
+          FALIX_PASSWORD: ${{ secrets.FALIX_PASSWORD }}
+          FALIX_SERVER_ID: ${{ secrets.FALIX_SERVER_ID }}
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          cat > run.mjs << 'EOF'
+          import { chromium } from 'playwright-core';
+          import { execSync } from 'child_process';
+          import fs from 'fs';
+
+          const EMAIL = process.env.FALIX_EMAIL;
+          const PASSWORD = process.env.FALIX_PASSWORD;
+          const SERVER_ID = process.env.FALIX_SERVER_ID;
+          const TG_TOKEN = process.env.TG_TOKEN;
+          const TG_CHAT_ID = process.env.TG_CHAT_ID;
+
+          const SERVER_URL = `https://client.falixnodes.net/server/${SERVER_ID}/console`;
+          const LOGIN_URL = 'https://client.falixnodes.net/auth/login';
+
+          // ─── 工具函数 ────────────────────────────────────────────────────
+
+          function sleep(ms) {
+            return new Promise(r => setTimeout(r, ms));
+          }
+
+          async function sendTelegram(msg) {
+            if (!TG_TOKEN || !TG_CHAT_ID) return;
+            const url = `https://api.telegram.org/bot${TG_TOKEN}/sendMessage`;
+            try {
+              const res = await fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ chat_id: TG_CHAT_ID, text: msg, parse_mode: 'HTML' })
+              });
+              const data = await res.json();
+              if (!data.ok) console.log('TG 发送失败:', JSON.stringify(data));
+            } catch (e) {
+              console.log('TG 发送异常:', e.message);
+            }
+          }
+
+          async function sendTelegramPhoto(token, chatId, imagePath, caption) {
+            if (!token || !chatId || !fs.existsSync(imagePath)) return;
+            try {
+              const FormData = (await import('formdata-node')).FormData;
+              const { fileFromPath } = await import('formdata-node/file-from-path');
+              const form = new FormData();
+              form.set('chat_id', chatId);
+              form.set('caption', caption || '');
+              form.set('photo', await fileFromPath(imagePath));
+              await fetch(`https://api.telegram.org/bot${token}/sendPhoto`, {
+                method: 'POST', body: form
+              });
+            } catch {
+              // 截图发送失败不影响主流程
+            }
+          }
+
+          // ─── CDP 鼠标模拟（绕过 Cloudflare Turnstile）────────────────────
+
+          async function cdpMouseMove(client, fromX, fromY, toX, toY, steps = 20) {
+            for (let i = 0; i <= steps; i++) {
+              const x = fromX + (toX - fromX) * (i / steps) + (Math.random() - 0.5) * 2;
+              const y = fromY + (toY - fromY) * (i / steps) + (Math.random() - 0.5) * 2;
+              await client.send('Input.dispatchMouseEvent', {
+                type: 'mouseMoved', x, y,
+                modifiers: 0, buttons: 0, button: 'none', clickCount: 0
+              });
+              await sleep(10 + Math.random() * 20);
+            }
+          }
+
+          async function cdpClick(client, x, y) {
+            // 移动到目标附近
+            await cdpMouseMove(client, x - 50 + Math.random() * 20, y + Math.random() * 10, x, y, 15);
+            await sleep(50 + Math.random() * 100);
+            await client.send('Input.dispatchMouseEvent', {
+              type: 'mousePressed', x, y,
+              modifiers: 0, button: 'left', buttons: 1, clickCount: 1
+            });
+            await sleep(80 + Math.random() * 60);
+            await client.send('Input.dispatchMouseEvent', {
+              type: 'mouseReleased', x, y,
+              modifiers: 0, button: 'left', buttons: 0, clickCount: 1
+            });
+          }
+
+          async function cdpType(client, page, selector, text) {
+            await page.focus(selector);
+            await sleep(200);
+            for (const char of text) {
+              await client.send('Input.dispatchKeyEvent', {
+                type: 'keyDown', text: char
+              });
+              await sleep(30 + Math.random() * 60);
+              await client.send('Input.dispatchKeyEvent', {
+                type: 'keyUp', text: char
+              });
+              await sleep(20 + Math.random() * 40);
+            }
+          }
+
+          // ─── 获取 Shadow DOM 内 Turnstile checkbox 坐标 ─────────────────
+
+          async function getTurnstileCheckboxCenter(page) {
+            try {
+              const rect = await page.evaluate(() => {
+                // Cloudflare Turnstile 的 checkbox 藏在多层 shadow DOM 中
+                const widgets = document.querySelectorAll('[data-sitekey], cf-turnstile, .cf-turnstile');
+                for (const w of widgets) {
+                  const iframe = w.querySelector('iframe') || w.shadowRoot?.querySelector('iframe');
+                  if (iframe) {
+                    const r = iframe.getBoundingClientRect();
+                    if (r.width > 0) return { x: r.left + 25, y: r.top + r.height / 2 };
+                  }
+                }
+                // 备用：直接找 Turnstile iframe
+                const iframes = document.querySelectorAll('iframe[src*="challenges.cloudflare.com"]');
+                for (const f of iframes) {
+                  const r = f.getBoundingClientRect();
+                  if (r.width > 0) return { x: r.left + 25, y: r.top + r.height / 2 };
+                }
+                return null;
+              });
+              return rect;
+            } catch {
+              return null;
+            }
+          }
+
+          // ─── 等待 Turnstile 通过 ──────────────────────────────────────────
+
+          async function waitTurnstilePass(page, timeoutMs = 30000) {
+            const start = Date.now();
+            while (Date.now() - start < timeoutMs) {
+              const passed = await page.evaluate(() => {
+                // 检查 turnstile token 是否已生成
+                const inputs = document.querySelectorAll('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]');
+                for (const inp of inputs) {
+                  if (inp.value && inp.value.length > 10) return true;
+                }
+                return false;
+              });
+              if (passed) return true;
+              await sleep(500);
+            }
+            return false;
+          }
+
+          // ─── 主流程 ───────────────────────────────────────────────────────
+
+          async function main() {
+            console.log('🚀 启动 Chrome（CDP 模式）...');
+
+            // 找到 Chrome 路径
+            let chromePath = '/usr/bin/google-chrome-stable';
+            if (!fs.existsSync(chromePath)) chromePath = '/usr/bin/google-chrome';
+            if (!fs.existsSync(chromePath)) chromePath = '/usr/bin/chromium-browser';
+
+            // 启动 Chrome 远程调试
+            const debugPort = 9222;
+            const chromeArgs = [
+              chromePath,
+              `--remote-debugging-port=${debugPort}`,
+              '--no-sandbox',
+              '--disable-setuid-sandbox',
+              '--disable-blink-features=AutomationControlled',
+              '--disable-infobars',
+              '--window-size=1280,800',
+              '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+              '--lang=zh-CN,zh',
+              '--profile-directory=Default',
+              `--user-data-dir=/tmp/chrome-falix-${Date.now()}`,
+              'about:blank'
+            ].join(' ');
+
+            execSync(`${chromeArgs} &`, { stdio: 'ignore', shell: true });
+            await sleep(2000);
+
+            // 连接 Chrome
+            const browser = await chromium.connectOverCDP(`http://localhost:${debugPort}`);
+            const context = browser.contexts()[0];
+            const page = context.pages()[0] || await context.newPage();
+
+            try {
+              // ── Step 1: 登录 ────────────────────────────────────────────
+              console.log('📋 正在打开登录页...');
+              await page.goto(LOGIN_URL, { waitUntil: 'networkidle', timeout: 30000 });
+              await sleep(2000);
+
+              const client = await page.context().newCDPSession(page);
+
+              // 填写邮箱
+              console.log('✏️  填写邮箱...');
+              await cdpType(client, page, 'input[name="email"], input[type="email"], input[placeholder*="email" i]', EMAIL);
+              await sleep(500 + Math.random() * 300);
+
+              // 填写密码
+              console.log('✏️  填写密码...');
+              await cdpType(client, page, 'input[name="password"], input[type="password"]', PASSWORD);
+              await sleep(500 + Math.random() * 300);
+
+              // 处理 Cloudflare Turnstile
+              console.log('🤖 处理 Cloudflare Turnstile...');
+              await sleep(1500);
+
+              let turnstileDone = false;
+              // 尝试多次点击 Turnstile checkbox
+              for (let attempt = 0; attempt < 5; attempt++) {
+                const pos = await getTurnstileCheckboxCenter(page);
+                if (pos) {
+                  console.log(`  点击 Turnstile checkbox，坐标: (${pos.x.toFixed(0)}, ${pos.y.toFixed(0)})`);
+                  await cdpClick(client, pos.x, pos.y);
+                  await sleep(2000);
+                  turnstileDone = await waitTurnstilePass(page, 8000);
+                  if (turnstileDone) {
+                    console.log('  ✅ Turnstile 已通过');
+                    break;
+                  }
+                } else {
+                  console.log(`  未找到 Turnstile 元素，等待重试 (${attempt + 1}/5)...`);
+                  await sleep(2000);
+                }
+              }
+
+              if (!turnstileDone) {
+                console.log('⚠️  Turnstile 未明确通过，尝试直接提交...');
+              }
+
+              await sleep(500);
+
+              // 点击登录按钮
+              console.log('🔑 点击登录...');
+              const loginBtn = await page.$('button[type="submit"], button:has-text("Sign In"), input[type="submit"]');
+              if (loginBtn) {
+                const btnBox = await loginBtn.boundingBox();
+                if (btnBox) {
+                  await cdpClick(client, btnBox.x + btnBox.width / 2, btnBox.y + btnBox.height / 2);
+                }
+              } else {
+                await page.keyboard.press('Enter');
+              }
+
+              // 等待登录完成（URL 变化或 dashboard 出现）
+              console.log('⏳ 等待登录完成...');
+              try {
+                await page.waitForNavigation({ timeout: 20000 });
+              } catch {
+                await sleep(5000);
+              }
+
+              const currentUrl = page.url();
+              console.log('当前 URL:', currentUrl);
+
+              if (currentUrl.includes('/auth/login')) {
+                // 截图存证
+                await page.screenshot({ path: '/tmp/login_fail.png' });
+                await sendTelegram('❌ <b>Falix</b> 登录失败，仍在登录页，请检查账号密码或 Turnstile');
+                await sendTelegramPhoto(TG_TOKEN, TG_CHAT_ID, '/tmp/login_fail.png', '登录失败截图');
+                process.exit(1);
+              }
+
+              console.log('✅ 登录成功！');
+
+              // ── Step 2: 跳转到服务器控制台 ──────────────────────────────
+              console.log(`🖥️  跳转到服务器控制台: ${SERVER_URL}`);
+              await page.goto(SERVER_URL, { waitUntil: 'networkidle', timeout: 30000 });
+              await sleep(3000);
+
+              // ── Step 3: 检测服务器状态 ───────────────────────────────────
+
+              async function getServerStatus() {
+                return await page.evaluate(() => {
+                  // 查找状态标签
+                  const statusSelectors = [
+                    '.badge', '[class*="status"]', '[class*="badge"]',
+                    '.server-status', '.status-indicator'
+                  ];
+                  for (const sel of statusSelectors) {
+                    const els = document.querySelectorAll(sel);
+                    for (const el of els) {
+                      const text = el.textContent?.trim().toLowerCase();
+                      if (text === 'offline') return 'offline';
+                      if (text === 'starting') return 'starting';
+                      if (text === 'online' || text === 'running') return 'online';
+                    }
+                  }
+                  // 备用：全文扫描状态区域
+                  const allText = document.body.innerText.toLowerCase();
+                  if (allText.includes('● offline') || allText.includes('offline')) {
+                    // 避免误匹配，精确查找底部状态
+                    const spans = document.querySelectorAll('span, div, p');
+                    for (const s of spans) {
+                      const t = s.textContent?.trim().toLowerCase();
+                      if (t === 'offline') return 'offline';
+                      if (t === 'starting') return 'starting';
+                      if (t === 'online') return 'online';
+                    }
+                  }
+                  return 'unknown';
+                });
+              }
+
+              async function dismissAdModal() {
+                // 关闭广告弹窗（Cancel 按钮）
+                try {
+                  const cancelBtn = await page.$('button:has-text("Cancel"), [class*="cancel"], button[data-dismiss]');
+                  if (cancelBtn) {
+                    console.log('  🚫 发现广告弹窗，点击 Cancel...');
+                    await cancelBtn.click();
+                    await sleep(1000);
+                    return true;
+                  }
+                  // 备用：通过文本查找
+                  const btns = await page.$$('button');
+                  for (const btn of btns) {
+                    const txt = await btn.textContent();
+                    if (txt?.trim().toLowerCase() === 'cancel') {
+                      await btn.click();
+                      await sleep(1000);
+                      return true;
+                    }
+                  }
+                } catch {}
+                return false;
+              }
+
+              async function clickStartButton() {
+                // 先检查并关掉广告
+                await dismissAdModal();
+
+                // 点击 Start 按钮
+                const startBtn = await page.$('button:has-text("Start"), [class*="start-btn"], button[data-action="start"]');
+                if (startBtn) {
+                  const box = await startBtn.boundingBox();
+                  if (box) {
+                    console.log('  ▶️  点击 Start 按钮...');
+                    const cdp2 = await page.context().newCDPSession(page);
+                    await cdpClick(cdp2, box.x + box.width / 2, box.y + box.height / 2);
+                    await sleep(500);
+                    // 点击后立即检测广告弹窗
+                    await sleep(1500);
+                    await dismissAdModal();
+                    return true;
+                  }
+                }
+                console.log('  ⚠️  未找到 Start 按钮');
+                return false;
+              }
+
+              const status = await getServerStatus();
+              console.log(`📊 服务器当前状态: ${status}`);
+
+              if (status === 'starting' || status === 'online') {
+                console.log('✅ 服务器已在运行/启动中，无需操作，工作流结束。');
+                await sendTelegram(`✅ <b>Falix</b> 服务器已是 <code>${status}</code> 状态，无需操作。`);
+                process.exit(0);
+              }
+
+              if (status === 'offline' || status === 'unknown') {
+                console.log('🔴 服务器 Offline，准备启动...');
+
+                // 第一次尝试启动
+                await clickStartButton();
+
+                // 等待 15 秒，观察状态
+                console.log('⏳ 等待 15 秒，观察状态变化...');
+                await sleep(15000);
+
+                // 刷新页面获取最新状态
+                await page.reload({ waitUntil: 'networkidle', timeout: 20000 });
+                await sleep(2000);
+
+                const statusAfter = await getServerStatus();
+                console.log(`📊 15 秒后状态: ${statusAfter}`);
+
+                if (statusAfter === 'starting' || statusAfter === 'online') {
+                  console.log('✅ 服务器已成功启动！');
+                  await page.screenshot({ path: '/tmp/started.png' });
+                  await sendTelegram(`✅ <b>Falix</b> 服务器已成功启动，当前状态: <code>${statusAfter}</code>`);
+                  await sendTelegramPhoto(TG_TOKEN, TG_CHAT_ID, '/tmp/started.png', '服务器启动成功');
+                } else {
+                  // 状态未变，再次点击 Start
+                  console.log('⚠️  状态未变，再次点击 Start...');
+                  await clickStartButton();
+                  await sleep(5000);
+                  await page.reload({ waitUntil: 'networkidle', timeout: 20000 });
+                  await sleep(2000);
+
+                  const statusFinal = await getServerStatus();
+                  console.log(`📊 最终状态: ${statusFinal}`);
+
+                  await page.screenshot({ path: '/tmp/final.png' });
+                  if (statusFinal === 'starting' || statusFinal === 'online') {
+                    await sendTelegram(`✅ <b>Falix</b> 二次启动成功，当前状态: <code>${statusFinal}</code>`);
+                  } else {
+                    await sendTelegram(`⚠️ <b>Falix</b> 二次尝试后状态仍为 <code>${statusFinal}</code>，请手动检查`);
+                  }
+                  await sendTelegramPhoto(TG_TOKEN, TG_CHAT_ID, '/tmp/final.png', '最终状态截图');
+                }
+              }
+
+            } catch (err) {
+              console.error('❌ 运行出错:', err.message);
+              try {
+                await page.screenshot({ path: '/tmp/error.png' });
+                await sendTelegram(`❌ <b>Falix</b> 工作流出错: ${err.message}`);
+                await sendTelegramPhoto(TG_TOKEN, TG_CHAT_ID, '/tmp/error.png', '错误截图');
+              } catch {}
+              process.exit(1);
+            } finally {
+              await browser.close().catch(() => {});
+            }
+          }
+
+          main();
+          EOF
+          node run.mjs
