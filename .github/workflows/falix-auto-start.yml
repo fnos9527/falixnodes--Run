@@ -60,8 +60,6 @@ jobs:
 
           const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-          // ── 截图（带步骤名，保存到 /tmp/screenshots/）────────────────────
-
           const SHOT_DIR = '/tmp/screenshots';
           fs.mkdirSync(SHOT_DIR, { recursive: true });
 
@@ -69,10 +67,8 @@ jobs:
             const p = `${SHOT_DIR}/${name}.png`;
             try {
               await page.screenshot({ path: p, fullPage: true });
-              console.log(`  📸 截图: ${p}`);
-            } catch (e) {
-              console.log(`  📸 截图失败(${name}): ${e.message}`);
-            }
+              console.log(`  📸 ${name}`);
+            } catch (e) { console.log(`  📸 截图失败(${name}): ${e.message}`); }
           }
 
           async function sendTelegram(msg) {
@@ -92,6 +88,75 @@ jobs:
             for (const char of text) {
               await page.keyboard.type(char, { delay: 40 + Math.random() * 60 });
             }
+          }
+
+          // ── 手动点击 Turnstile（在填完账密之后）─────────────────────────
+          // turnstile: false，自己控制时序，避免 token 提前过期
+
+          async function clickTurnstile(page) {
+            // puppeteer-real-browser 暴露了 _target，可以拿到 CDP session
+            // 但更简单：直接找 Turnstile iframe 用 page.mouse.click 点击
+            for (let i = 0; i < 20; i++) {
+              try {
+                // 找 challenges.cloudflare.com iframe
+                const frames = page.frames();
+                for (const frame of frames) {
+                  const url = frame.url();
+                  if (!url.includes('challenges.cloudflare.com')) continue;
+
+                  // 找 checkbox
+                  const cb = await frame.$('input[type="checkbox"]');
+                  if (cb) {
+                    const box = await cb.boundingBox();
+                    if (box && box.width > 0) {
+                      // 拿 iframe 在主页面的位置
+                      const iframeEl = await frame.frameElement();
+                      const iframeBox = await iframeEl.boundingBox();
+                      if (!iframeBox) continue;
+
+                      const clickX = iframeBox.x + box.x + box.width / 2;
+                      const clickY = iframeBox.y + box.y + box.height / 2;
+
+                      console.log(`  >> 点击 Turnstile checkbox: (${clickX.toFixed(0)}, ${clickY.toFixed(0)})`);
+                      await page.mouse.move(clickX - 30, clickY, { steps: 8 });
+                      await sleep(50);
+                      await page.mouse.move(clickX, clickY, { steps: 8 });
+                      await sleep(80);
+                      await page.mouse.click(clickX, clickY);
+                      return true;
+                    }
+                  }
+                }
+              } catch {}
+              await sleep(1000);
+              if (i % 5 === 4) console.log(`  >> 等待 Turnstile 加载... (${i + 1}/20)`);
+            }
+            return false;
+          }
+
+          async function waitTurnstileSuccess(page, timeoutMs = 20000) {
+            const end = Date.now() + timeoutMs;
+            while (Date.now() < end) {
+              // 方法1：检查 hidden input token
+              const hasToken = await page.evaluate(() => {
+                const inputs = document.querySelectorAll(
+                  'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]'
+                );
+                return [...inputs].some(i => i.value && i.value.length > 10);
+              }).catch(() => false);
+              if (hasToken) return true;
+
+              // 方法2：检查 Turnstile iframe 里的 Success! 文字
+              for (const frame of page.frames()) {
+                if (!frame.url().includes('challenges.cloudflare.com')) continue;
+                try {
+                  const text = await frame.evaluate(() => document.body.innerText).catch(() => '');
+                  if (text.includes('Success')) return true;
+                } catch {}
+              }
+              await sleep(500);
+            }
+            return false;
           }
 
           async function getServerStatus(page) {
@@ -119,11 +184,10 @@ jobs:
 
           async function dismissAd(page) {
             try {
-              const btns = await page.$$('button');
-              for (const btn of btns) {
+              for (const btn of await page.$$('button')) {
                 const txt = (await btn.evaluate(el => el.textContent))?.trim().toLowerCase();
                 if (txt === 'cancel') {
-                  console.log('  🚫 关闭广告弹窗');
+                  console.log('  🚫 关闭广告');
                   await btn.click();
                   await sleep(1000);
                   return true;
@@ -135,8 +199,7 @@ jobs:
 
           async function clickStart(page) {
             await dismissAd(page);
-            const btns = await page.$$('button');
-            for (const btn of btns) {
+            for (const btn of await page.$$('button')) {
               const txt = (await btn.evaluate(el => el.textContent))?.trim().toLowerCase();
               if (txt === 'start') {
                 const box = await btn.boundingBox();
@@ -159,7 +222,7 @@ jobs:
             console.log('🚀 启动浏览器...');
             const { browser, page } = await connect({
               headless: false,
-              turnstile: true,
+              turnstile: false,     // ← 关闭自动 Turnstile，手动控制时序
               disableXvfb: false,
               args: [
                 '--no-sandbox',
@@ -173,53 +236,44 @@ jobs:
                 chromePath: '/usr/bin/google-chrome-stable',
               },
               connectOption: {
-                defaultViewport: { width: 1280, height: 800 }
+                defaultViewport: { width: 1280, height: 800 },
+                protocolTimeout: 60000,
               },
             });
             console.log('✅ 浏览器已启动');
 
             try {
-              // ── 登录页 ────────────────────────────────────────────────────
+              // ── Step 1: 打开登录页 ────────────────────────────────────────
               console.log('📋 打开登录页...');
               await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
-              await sleep(2500);
+              await sleep(2000);
               await shot(page, '01_login_page');
 
-              // 填邮箱
+              // ── Step 2: 填邮箱 ────────────────────────────────────────────
               console.log('✏️  填写邮箱...');
               await humanType(page, 'input[name="email"], input[type="email"]', EMAIL);
-              await sleep(400 + Math.random() * 300);
-              await shot(page, '02_after_email');
+              await sleep(500);
 
-              // 填密码
+              // ── Step 3: 填密码 ────────────────────────────────────────────
               console.log('✏️  填写密码...');
               await humanType(page, 'input[name="password"], input[type="password"]', PASSWORD);
-              await sleep(400 + Math.random() * 300);
-              await shot(page, '03_after_password');
+              await sleep(500);
+              await shot(page, '02_filled_credentials');
 
-              // 等 Turnstile
-              console.log('🤖 等待 Turnstile...');
-              let turnstileOk = false;
-              for (let i = 0; i < 20; i++) {
-                const ok = await page.evaluate(() => {
-                  const inputs = document.querySelectorAll(
-                    'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]'
-                  );
-                  return [...inputs].some(inp => inp.value && inp.value.length > 10);
-                }).catch(() => false);
-                if (ok) { turnstileOk = true; console.log('  ✅ Turnstile token 已生成'); break; }
-                if (i % 5 === 4) {
-                  console.log(`  等待中... (${i + 1}/20s)`);
-                  await shot(page, `04_turnstile_wait_${i + 1}s`);
-                }
-                await sleep(1000);
+              // ── Step 4: 手动点 Turnstile（账密填完之后）──────────────────
+              console.log('🤖 点击 Turnstile（账密已填，token 不会提前过期）...');
+              const clicked = await clickTurnstile(page);
+              if (clicked) {
+                console.log('  >> 等待 Turnstile 验证通过...');
+                const ok = await waitTurnstileSuccess(page, 20000);
+                console.log(ok ? '  ✅ Turnstile 通过' : '  ⚠️  Turnstile 未明确通过，继续...');
+              } else {
+                console.log('  ⚠️  未找到 Turnstile，直接提交...');
               }
-              await shot(page, '05_after_turnstile');
+              await shot(page, '03_after_turnstile');
 
-              if (!turnstileOk) console.log('⚠️  Turnstile 未明确通过，继续提交...');
-
-              // 提交登录
-              console.log('🔑 点击登录按钮...');
+              // ── Step 5: 立刻提交登录 ──────────────────────────────────────
+              console.log('🔑 提交登录...');
               const loginBtn = await page.$('button[type="submit"]');
               if (loginBtn) {
                 await loginBtn.click();
@@ -227,34 +281,32 @@ jobs:
                 await page.keyboard.press('Enter');
               }
 
-              // 等跳转
               try {
                 await page.waitForNavigation({ timeout: 20000, waitUntil: 'domcontentloaded' });
               } catch { await sleep(5000); }
 
               const afterUrl = page.url();
               console.log('当前 URL:', afterUrl);
-              await shot(page, '06_after_login_submit');
+              await shot(page, '04_after_login');
 
               if (afterUrl.includes('/auth/login')) {
-                // 截图并打印页面错误提示文字
                 const errText = await page.evaluate(() => {
-                  const alerts = document.querySelectorAll('.alert, .error, [class*="error"], [class*="alert"], [role="alert"]');
-                  return [...alerts].map(el => el.textContent?.trim()).filter(Boolean).join(' | ');
+                  const els = document.querySelectorAll('.alert, .error, [class*="error"], [class*="alert"], [role="alert"]');
+                  return [...els].map(e => e.textContent?.trim()).filter(Boolean).join(' | ');
                 }).catch(() => '');
-                console.log('❌ 登录失败，页面错误信息:', errText || '(未找到错误文字)');
-                await sendTelegram(`❌ <b>Falix</b> 登录失败\n错误: ${errText || '未知'}`);
+                console.log('❌ 登录失败，错误:', errText || '(无错误文字)');
+                await sendTelegram(`❌ <b>Falix</b> 登录失败: ${errText || '未知'}`);
                 process.exit(1);
               }
               console.log('✅ 登录成功！');
 
-              // ── 跳转控制台 ─────────────────────────────────────────────────
+              // ── Step 6: 跳转控制台 ────────────────────────────────────────
               console.log(`🖥️  跳转: ${SERVER_URL}`);
               await page.goto(SERVER_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
               await sleep(3000);
-              await shot(page, '07_console_page');
+              await shot(page, '05_console');
 
-              // ── 状态检测 ───────────────────────────────────────────────────
+              // ── Step 7: 检测状态 & 操作 ───────────────────────────────────
               const status = await getServerStatus(page);
               console.log(`📊 当前状态: ${status}`);
 
@@ -266,16 +318,16 @@ jobs:
 
               console.log('🔴 Offline，开始启动...');
               await clickStart(page);
-              await shot(page, '08_after_start_click');
+              await shot(page, '06_after_start');
 
               console.log('⏳ 等待 15 秒...');
               await sleep(15000);
               await page.reload({ waitUntil: 'domcontentloaded' });
               await sleep(2000);
-              await shot(page, '09_after_15s');
 
               const status2 = await getServerStatus(page);
               console.log(`📊 15s 后: ${status2}`);
+              await shot(page, '07_after_15s');
 
               if (status2 === 'starting' || status2 === 'online') {
                 await sendTelegram(`✅ <b>Falix</b> 启动成功，状态: <code>${status2}</code>`);
@@ -287,8 +339,8 @@ jobs:
                 await page.reload({ waitUntil: 'domcontentloaded' });
                 await sleep(2000);
                 const status3 = await getServerStatus(page);
-                console.log(`📊 最终状态: ${status3}`);
-                await shot(page, '10_final');
+                console.log(`📊 最终: ${status3}`);
+                await shot(page, '08_final');
                 if (status3 === 'starting' || status3 === 'online') {
                   await sendTelegram(`✅ <b>Falix</b> 二次启动成功，状态: <code>${status3}</code>`);
                 } else {
