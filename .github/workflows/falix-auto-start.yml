@@ -21,7 +21,6 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          # Xvfb 虚拟显示器（Chrome 有头模式在无 GUI 服务器上必须）
           sudo apt-get update -qq
           sudo apt-get install -y xvfb
 
@@ -36,7 +35,6 @@ jobs:
       - name: Install Node dependencies
         run: |
           npm init -y
-          # puppeteer-real-browser：内置 Xvfb + Turnstile 自动点击
           npm install puppeteer-real-browser puppeteer-core
 
       - name: Run Falix Auto Start
@@ -60,9 +58,22 @@ jobs:
           const LOGIN_URL  = 'https://client.falixnodes.net/auth/login';
           const SERVER_URL = `https://client.falixnodes.net/server/${SERVER_ID}/console`;
 
-          // ── 工具 ─────────────────────────────────────────────────────────
-
           const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+          // ── 截图（带步骤名，保存到 /tmp/screenshots/）────────────────────
+
+          const SHOT_DIR = '/tmp/screenshots';
+          fs.mkdirSync(SHOT_DIR, { recursive: true });
+
+          async function shot(page, name) {
+            const p = `${SHOT_DIR}/${name}.png`;
+            try {
+              await page.screenshot({ path: p, fullPage: true });
+              console.log(`  📸 截图: ${p}`);
+            } catch (e) {
+              console.log(`  📸 截图失败(${name}): ${e.message}`);
+            }
+          }
 
           async function sendTelegram(msg) {
             if (!TG_TOKEN || !TG_CHAT_ID) return;
@@ -75,8 +86,6 @@ jobs:
             } catch (e) { console.log('TG 失败:', e.message); }
           }
 
-          // ── 人类化输入 ────────────────────────────────────────────────────
-
           async function humanType(page, selector, text) {
             await page.focus(selector);
             await sleep(200);
@@ -84,8 +93,6 @@ jobs:
               await page.keyboard.type(char, { delay: 40 + Math.random() * 60 });
             }
           }
-
-          // ── 状态检测 ──────────────────────────────────────────────────────
 
           async function getServerStatus(page) {
             return page.evaluate(() => {
@@ -110,8 +117,6 @@ jobs:
             });
           }
 
-          // ── 广告弹窗 ──────────────────────────────────────────────────────
-
           async function dismissAd(page) {
             try {
               const btns = await page.$$('button');
@@ -127,8 +132,6 @@ jobs:
             } catch {}
             return false;
           }
-
-          // ── 点击 Start ────────────────────────────────────────────────────
 
           async function clickStart(page) {
             await dismissAd(page);
@@ -152,17 +155,12 @@ jobs:
             return false;
           }
 
-          // ── 主流程 ────────────────────────────────────────────────────────
-
           async function main() {
-            console.log('🚀 启动浏览器（puppeteer-real-browser + Xvfb）...');
-
-            // puppeteer-real-browser 自动管理 Xvfb 虚拟显示器
-            // turnstile: true 内置 Turnstile 自动点击
+            console.log('🚀 启动浏览器...');
             const { browser, page } = await connect({
-              headless: false,          // 有头模式（Xvfb 提供虚拟显示）
-              turnstile: true,          // 自动处理 Cloudflare Turnstile
-              disableXvfb: false,       // 启用 Xvfb（Linux 无 GUI 环境必须）
+              headless: false,
+              turnstile: true,
+              disableXvfb: false,
               args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
@@ -178,28 +176,29 @@ jobs:
                 defaultViewport: { width: 1280, height: 800 }
               },
             });
-
             console.log('✅ 浏览器已启动');
 
             try {
-              // ── 登录 ──────────────────────────────────────────────────────
+              // ── 登录页 ────────────────────────────────────────────────────
               console.log('📋 打开登录页...');
               await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
               await sleep(2500);
+              await shot(page, '01_login_page');
 
+              // 填邮箱
               console.log('✏️  填写邮箱...');
-              await humanType(page,
-                'input[name="email"], input[type="email"]', EMAIL);
+              await humanType(page, 'input[name="email"], input[type="email"]', EMAIL);
               await sleep(400 + Math.random() * 300);
+              await shot(page, '02_after_email');
 
+              // 填密码
               console.log('✏️  填写密码...');
-              await humanType(page,
-                'input[name="password"], input[type="password"]', PASSWORD);
+              await humanType(page, 'input[name="password"], input[type="password"]', PASSWORD);
               await sleep(400 + Math.random() * 300);
+              await shot(page, '03_after_password');
 
-              // Turnstile 由 puppeteer-real-browser 自动处理（turnstile: true）
-              // 等待 token 出现
-              console.log('🤖 等待 Turnstile 自动处理...');
+              // 等 Turnstile
+              console.log('🤖 等待 Turnstile...');
               let turnstileOk = false;
               for (let i = 0; i < 20; i++) {
                 const ok = await page.evaluate(() => {
@@ -209,11 +208,17 @@ jobs:
                   return [...inputs].some(inp => inp.value && inp.value.length > 10);
                 }).catch(() => false);
                 if (ok) { turnstileOk = true; console.log('  ✅ Turnstile token 已生成'); break; }
-                if (i % 5 === 4) console.log(`  等待中... (${i + 1}/20s)`);
+                if (i % 5 === 4) {
+                  console.log(`  等待中... (${i + 1}/20s)`);
+                  await shot(page, `04_turnstile_wait_${i + 1}s`);
+                }
                 await sleep(1000);
               }
+              await shot(page, '05_after_turnstile');
+
               if (!turnstileOk) console.log('⚠️  Turnstile 未明确通过，继续提交...');
 
+              // 提交登录
               console.log('🔑 点击登录按钮...');
               const loginBtn = await page.$('button[type="submit"]');
               if (loginBtn) {
@@ -222,17 +227,23 @@ jobs:
                 await page.keyboard.press('Enter');
               }
 
-              // 等待跳转
+              // 等跳转
               try {
                 await page.waitForNavigation({ timeout: 20000, waitUntil: 'domcontentloaded' });
               } catch { await sleep(5000); }
 
               const afterUrl = page.url();
               console.log('当前 URL:', afterUrl);
+              await shot(page, '06_after_login_submit');
 
               if (afterUrl.includes('/auth/login')) {
-                await page.screenshot({ path: '/tmp/login_fail.png' });
-                await sendTelegram('❌ <b>Falix</b> 登录失败，仍在登录页');
+                // 截图并打印页面错误提示文字
+                const errText = await page.evaluate(() => {
+                  const alerts = document.querySelectorAll('.alert, .error, [class*="error"], [class*="alert"], [role="alert"]');
+                  return [...alerts].map(el => el.textContent?.trim()).filter(Boolean).join(' | ');
+                }).catch(() => '');
+                console.log('❌ 登录失败，页面错误信息:', errText || '(未找到错误文字)');
+                await sendTelegram(`❌ <b>Falix</b> 登录失败\n错误: ${errText || '未知'}`);
                 process.exit(1);
               }
               console.log('✅ 登录成功！');
@@ -241,8 +252,9 @@ jobs:
               console.log(`🖥️  跳转: ${SERVER_URL}`);
               await page.goto(SERVER_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
               await sleep(3000);
+              await shot(page, '07_console_page');
 
-              // ── 检测状态 & 操作 ────────────────────────────────────────────
+              // ── 状态检测 ───────────────────────────────────────────────────
               const status = await getServerStatus(page);
               console.log(`📊 当前状态: ${status}`);
 
@@ -254,38 +266,39 @@ jobs:
 
               console.log('🔴 Offline，开始启动...');
               await clickStart(page);
+              await shot(page, '08_after_start_click');
 
               console.log('⏳ 等待 15 秒...');
               await sleep(15000);
               await page.reload({ waitUntil: 'domcontentloaded' });
               await sleep(2000);
+              await shot(page, '09_after_15s');
 
               const status2 = await getServerStatus(page);
               console.log(`📊 15s 后: ${status2}`);
 
               if (status2 === 'starting' || status2 === 'online') {
-                await page.screenshot({ path: '/tmp/ok.png' });
                 await sendTelegram(`✅ <b>Falix</b> 启动成功，状态: <code>${status2}</code>`);
                 console.log('✅ 启动成功！');
               } else {
-                console.log('⚠️  状态未变，再次点击 Start...');
+                console.log('⚠️  再次点击 Start...');
                 await clickStart(page);
                 await sleep(8000);
                 await page.reload({ waitUntil: 'domcontentloaded' });
                 await sleep(2000);
                 const status3 = await getServerStatus(page);
                 console.log(`📊 最终状态: ${status3}`);
-                await page.screenshot({ path: '/tmp/final.png' });
+                await shot(page, '10_final');
                 if (status3 === 'starting' || status3 === 'online') {
                   await sendTelegram(`✅ <b>Falix</b> 二次启动成功，状态: <code>${status3}</code>`);
                 } else {
-                  await sendTelegram(`⚠️ <b>Falix</b> 两次后仍为 <code>${status3}</code>，请手动检查`);
+                  await sendTelegram(`⚠️ <b>Falix</b> 两次后仍为 <code>${status3}</code>`);
                 }
               }
 
             } catch (err) {
               console.error('❌ 出错:', err.message);
-              try { await page.screenshot({ path: '/tmp/error.png' }); } catch {}
+              await shot(page, 'error');
               await sendTelegram(`❌ <b>Falix</b> 出错: ${err.message}`);
               process.exit(1);
             } finally {
@@ -296,3 +309,11 @@ jobs:
           main();
           EOF
           node run.mjs
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: falix-screenshots
+          path: /tmp/screenshots/
+          retention-days: 3
