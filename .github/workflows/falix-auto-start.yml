@@ -64,11 +64,10 @@ jobs:
           fs.mkdirSync(SHOT_DIR, { recursive: true });
 
           async function shot(page, name) {
-            const p = `${SHOT_DIR}/${name}.png`;
             try {
-              await page.screenshot({ path: p, fullPage: true });
+              await page.screenshot({ path: `${SHOT_DIR}/${name}.png`, fullPage: true });
               console.log(`  📸 ${name}`);
-            } catch (e) { console.log(`  📸 截图失败(${name}): ${e.message}`); }
+            } catch (e) { console.log(`  📸 失败(${name}): ${e.message}`); }
           }
 
           async function sendTelegram(msg) {
@@ -90,67 +89,145 @@ jobs:
             }
           }
 
-          // ── 手动点击 Turnstile（在填完账密之后）─────────────────────────
-          // turnstile: false，自己控制时序，避免 token 提前过期
+          // ── Turnstile 点击：CDP 穿透 Shadow DOM ───────────────────────────
+          // 从截图可见 Turnstile widget 在主页面（非 iframe），checkbox 在 Shadow DOM 里
+          // 用 CDP Input.dispatchMouseEvent 模拟点击，绕过 Shadow DOM 限制
 
-          async function clickTurnstile(page) {
-            // puppeteer-real-browser 暴露了 _target，可以拿到 CDP session
-            // 但更简单：直接找 Turnstile iframe 用 page.mouse.click 点击
-            for (let i = 0; i < 20; i++) {
-              try {
-                // 找 challenges.cloudflare.com iframe
-                const frames = page.frames();
-                for (const frame of frames) {
-                  const url = frame.url();
-                  if (!url.includes('challenges.cloudflare.com')) continue;
+          async function clickTurnstileViaCDP(page) {
+            // 先尝试从主页面找 Turnstile iframe/widget 的屏幕坐标
+            for (let attempt = 0; attempt < 20; attempt++) {
 
-                  // 找 checkbox
-                  const cb = await frame.$('input[type="checkbox"]');
-                  if (cb) {
-                    const box = await cb.boundingBox();
-                    if (box && box.width > 0) {
-                      // 拿 iframe 在主页面的位置
-                      const iframeEl = await frame.frameElement();
-                      const iframeBox = await iframeEl.boundingBox();
-                      if (!iframeBox) continue;
-
-                      const clickX = iframeBox.x + box.x + box.width / 2;
-                      const clickY = iframeBox.y + box.y + box.height / 2;
-
-                      console.log(`  >> 点击 Turnstile checkbox: (${clickX.toFixed(0)}, ${clickY.toFixed(0)})`);
-                      await page.mouse.move(clickX - 30, clickY, { steps: 8 });
-                      await sleep(50);
-                      await page.mouse.move(clickX, clickY, { steps: 8 });
-                      await sleep(80);
-                      await page.mouse.click(clickX, clickY);
-                      return true;
+              // 方案A：主页面直接找 cf-turnstile 容器的位置，用绝对坐标点击 checkbox 区域
+              const pos = await page.evaluate(() => {
+                // 找 Turnstile 容器（各种选择器）
+                const selectors = [
+                  'cf-turnstile',
+                  '[data-sitekey]',
+                  '.cf-turnstile',
+                  'iframe[src*="challenges.cloudflare.com"]',
+                  'iframe[src*="turnstile"]',
+                ];
+                for (const sel of selectors) {
+                  const el = document.querySelector(sel);
+                  if (el) {
+                    const r = el.getBoundingClientRect();
+                    if (r.width > 0 && r.height > 0) {
+                      // checkbox 通常在 widget 左侧，约 x+24, y+中间
+                      return {
+                        x: r.left + 24,
+                        y: r.top + r.height / 2,
+                        w: r.width,
+                        h: r.height,
+                        tag: el.tagName
+                      };
                     }
                   }
                 }
-              } catch {}
+                return null;
+              });
+
+              if (pos) {
+                console.log(`  >> 找到 Turnstile widget (${pos.tag}): rect=(${pos.x.toFixed(0)},${pos.y.toFixed(0)}) size=${pos.w.toFixed(0)}x${pos.h.toFixed(0)})`);
+
+                // 用 CDP 发送真实鼠标事件（穿透 Shadow DOM）
+                const cdpClient = await page.target().createCDPSession();
+
+                // 移动鼠标到附近
+                await cdpClient.send('Input.dispatchMouseEvent', {
+                  type: 'mouseMoved', x: pos.x - 40, y: pos.y,
+                  modifiers: 0, buttons: 0, button: 'none', clickCount: 0
+                });
+                await sleep(100);
+                for (let step = 1; step <= 10; step++) {
+                  await cdpClient.send('Input.dispatchMouseEvent', {
+                    type: 'mouseMoved',
+                    x: (pos.x - 40) + (40 * step / 10),
+                    y: pos.y + (Math.random() - 0.5) * 2,
+                    modifiers: 0, buttons: 0, button: 'none', clickCount: 0
+                  });
+                  await sleep(15 + Math.random() * 15);
+                }
+                await sleep(80 + Math.random() * 60);
+
+                // 点击
+                await cdpClient.send('Input.dispatchMouseEvent', {
+                  type: 'mousePressed', x: pos.x, y: pos.y,
+                  modifiers: 0, button: 'left', buttons: 1, clickCount: 1
+                });
+                await sleep(80 + Math.random() * 60);
+                await cdpClient.send('Input.dispatchMouseEvent', {
+                  type: 'mouseReleased', x: pos.x, y: pos.y,
+                  modifiers: 0, button: 'left', buttons: 0, clickCount: 1
+                });
+
+                await cdpClient.detach();
+                console.log(`  >> CDP 点击已发送`);
+                return true;
+              }
+
+              // 方案B：遍历所有 frames 找 Turnstile（兼容嵌套 iframe 情况）
+              const allFrames = page.frames();
+              for (const frame of allFrames) {
+                try {
+                  const frameUrl = frame.url();
+                  if (!frameUrl.includes('challenges.cloudflare.com') &&
+                      !frameUrl.includes('turnstile')) continue;
+
+                  const iframeEl = await frame.frameElement();
+                  if (!iframeEl) continue;
+                  const box = await iframeEl.boundingBox();
+                  if (!box || box.width === 0) continue;
+
+                  // checkbox 在 iframe 左侧约 24px
+                  const cx = box.x + 24;
+                  const cy = box.y + box.height / 2;
+                  console.log(`  >> 在 frame 里找到 Turnstile: (${cx.toFixed(0)}, ${cy.toFixed(0)})`);
+
+                  const cdpClient = await page.target().createCDPSession();
+                  await cdpClient.send('Input.dispatchMouseEvent', {
+                    type: 'mousePressed', x: cx, y: cy,
+                    modifiers: 0, button: 'left', buttons: 1, clickCount: 1
+                  });
+                  await sleep(80);
+                  await cdpClient.send('Input.dispatchMouseEvent', {
+                    type: 'mouseReleased', x: cx, y: cy,
+                    modifiers: 0, button: 'left', buttons: 0, clickCount: 1
+                  });
+                  await cdpClient.detach();
+                  return true;
+                } catch {}
+              }
+
+              if (attempt % 5 === 4) {
+                // 每5秒截一张图看 Turnstile 状态
+                await shot(page, `turnstile_debug_${attempt + 1}s`);
+                // 打印页面上所有 iframe src，帮助诊断
+                const iframeSrcs = await page.evaluate(() =>
+                  [...document.querySelectorAll('iframe')].map(f => f.src)
+                ).catch(() => []);
+                console.log(`  >> iframes: ${JSON.stringify(iframeSrcs)}`);
+              }
+
               await sleep(1000);
-              if (i % 5 === 4) console.log(`  >> 等待 Turnstile 加载... (${i + 1}/20)`);
             }
             return false;
           }
 
-          async function waitTurnstileSuccess(page, timeoutMs = 20000) {
+          async function waitTurnstileSuccess(page, timeoutMs = 15000) {
             const end = Date.now() + timeoutMs;
             while (Date.now() < end) {
-              // 方法1：检查 hidden input token
-              const hasToken = await page.evaluate(() => {
+              const ok = await page.evaluate(() => {
                 const inputs = document.querySelectorAll(
                   'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]'
                 );
                 return [...inputs].some(i => i.value && i.value.length > 10);
               }).catch(() => false);
-              if (hasToken) return true;
+              if (ok) return true;
 
-              // 方法2：检查 Turnstile iframe 里的 Success! 文字
               for (const frame of page.frames()) {
-                if (!frame.url().includes('challenges.cloudflare.com')) continue;
+                if (!frame.url().includes('cloudflare') && !frame.url().includes('turnstile')) continue;
                 try {
-                  const text = await frame.evaluate(() => document.body.innerText).catch(() => '');
+                  const text = await frame.evaluate(() => document.body?.innerText || '').catch(() => '');
                   if (text.includes('Success')) return true;
                 } catch {}
               }
@@ -222,7 +299,7 @@ jobs:
             console.log('🚀 启动浏览器...');
             const { browser, page } = await connect({
               headless: false,
-              turnstile: false,     // ← 关闭自动 Turnstile，手动控制时序
+              turnstile: false,
               disableXvfb: false,
               args: [
                 '--no-sandbox',
@@ -232,9 +309,7 @@ jobs:
                 '--window-size=1280,800',
                 '--lang=zh-CN,zh',
               ],
-              customConfig: {
-                chromePath: '/usr/bin/google-chrome-stable',
-              },
+              customConfig: { chromePath: '/usr/bin/google-chrome-stable' },
               connectOption: {
                 defaultViewport: { width: 1280, height: 800 },
                 protocolTimeout: 60000,
@@ -243,36 +318,40 @@ jobs:
             console.log('✅ 浏览器已启动');
 
             try {
-              // ── Step 1: 打开登录页 ────────────────────────────────────────
+              // ── 登录页 ────────────────────────────────────────────────────
               console.log('📋 打开登录页...');
               await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
               await sleep(2000);
               await shot(page, '01_login_page');
 
-              // ── Step 2: 填邮箱 ────────────────────────────────────────────
+              // 填邮箱
               console.log('✏️  填写邮箱...');
               await humanType(page, 'input[name="email"], input[type="email"]', EMAIL);
-              await sleep(500);
+              await sleep(400);
 
-              // ── Step 3: 填密码 ────────────────────────────────────────────
+              // 填密码
               console.log('✏️  填写密码...');
               await humanType(page, 'input[name="password"], input[type="password"]', PASSWORD);
-              await sleep(500);
+              await sleep(400);
               await shot(page, '02_filled_credentials');
 
-              // ── Step 4: 手动点 Turnstile（账密填完之后）──────────────────
-              console.log('🤖 点击 Turnstile（账密已填，token 不会提前过期）...');
-              const clicked = await clickTurnstile(page);
+              // 点 Turnstile（账密填完之后）
+              console.log('🤖 点击 Turnstile...');
+              const clicked = await clickTurnstileViaCDP(page);
               if (clicked) {
-                console.log('  >> 等待 Turnstile 验证通过...');
-                const ok = await waitTurnstileSuccess(page, 20000);
-                console.log(ok ? '  ✅ Turnstile 通过' : '  ⚠️  Turnstile 未明确通过，继续...');
+                console.log('  >> 等待验证结果...');
+                const ok = await waitTurnstileSuccess(page, 15000);
+                if (ok) {
+                  console.log('  ✅ Turnstile 验证通过');
+                } else {
+                  console.log('  ⚠️  Turnstile 未确认通过，尝试继续...');
+                }
               } else {
                 console.log('  ⚠️  未找到 Turnstile，直接提交...');
               }
               await shot(page, '03_after_turnstile');
 
-              // ── Step 5: 立刻提交登录 ──────────────────────────────────────
+              // 立刻提交
               console.log('🔑 提交登录...');
               const loginBtn = await page.$('button[type="submit"]');
               if (loginBtn) {
@@ -294,19 +373,18 @@ jobs:
                   const els = document.querySelectorAll('.alert, .error, [class*="error"], [class*="alert"], [role="alert"]');
                   return [...els].map(e => e.textContent?.trim()).filter(Boolean).join(' | ');
                 }).catch(() => '');
-                console.log('❌ 登录失败，错误:', errText || '(无错误文字)');
+                console.log('❌ 登录失败:', errText || '(无错误文字)');
                 await sendTelegram(`❌ <b>Falix</b> 登录失败: ${errText || '未知'}`);
                 process.exit(1);
               }
               console.log('✅ 登录成功！');
 
-              // ── Step 6: 跳转控制台 ────────────────────────────────────────
+              // ── 控制台 ────────────────────────────────────────────────────
               console.log(`🖥️  跳转: ${SERVER_URL}`);
               await page.goto(SERVER_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
               await sleep(3000);
               await shot(page, '05_console');
 
-              // ── Step 7: 检测状态 & 操作 ───────────────────────────────────
               const status = await getServerStatus(page);
               console.log(`📊 当前状态: ${status}`);
 
@@ -316,7 +394,7 @@ jobs:
                 process.exit(0);
               }
 
-              console.log('🔴 Offline，开始启动...');
+              console.log('🔴 Offline，启动...');
               await clickStart(page);
               await shot(page, '06_after_start');
 
@@ -331,7 +409,6 @@ jobs:
 
               if (status2 === 'starting' || status2 === 'online') {
                 await sendTelegram(`✅ <b>Falix</b> 启动成功，状态: <code>${status2}</code>`);
-                console.log('✅ 启动成功！');
               } else {
                 console.log('⚠️  再次点击 Start...');
                 await clickStart(page);
