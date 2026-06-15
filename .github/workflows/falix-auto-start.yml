@@ -35,7 +35,6 @@ jobs:
       - name: Write script
         run: |
           python3 - << 'PYEOF'
-          import os
           script = r"""
           import { connect } from 'puppeteer-real-browser';
           import fs from 'fs';
@@ -249,9 +248,13 @@ jobs:
             await browser.close().catch(()=>{});
           }
           """
-          with open('/home/runner/work/run.mjs', 'w') as f:
+          import os
+          # 写到当前工作目录（和 node_modules 同一目录）
+          cwd = os.environ.get('GITHUB_WORKSPACE', os.getcwd())
+          path = os.path.join(cwd, 'run.mjs')
+          with open(path, 'w') as f:
               f.write(script.strip())
-          print('script written ok')
+          print('written to: ' + path)
           PYEOF
 
       - name: Run script
@@ -261,7 +264,7 @@ jobs:
           FALIX_SERVER_ID: ${{ secrets.FALIX_SERVER_ID }}
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: node /home/runner/work/run.mjs
+        run: node run.mjs
 
       - name: Upload screenshots
         if: always()
