@@ -32,244 +32,236 @@ jobs:
       - name: Install Node dependencies
         run: npm init -y && npm install puppeteer-real-browser puppeteer-core
 
-      - name: Run
+      - name: Write script
+        run: |
+          python3 - << 'PYEOF'
+          import os
+          script = r"""
+          import { connect } from 'puppeteer-real-browser';
+          import fs from 'fs';
+
+          const EMAIL     = process.env.FALIX_EMAIL;
+          const PASSWORD  = process.env.FALIX_PASSWORD;
+          const SERVER_ID = process.env.FALIX_SERVER_ID;
+          const TG_TOKEN  = process.env.TG_TOKEN;
+          const TG_CHAT_ID= process.env.TG_CHAT_ID;
+          const LOGIN_URL = 'https://client.falixnodes.net/auth/login';
+          const SERVER_URL= `https://client.falixnodes.net/server/${SERVER_ID}/console`;
+
+          const sleep = ms => new Promise(r => setTimeout(r, ms));
+          fs.mkdirSync('/tmp/ss', { recursive: true });
+
+          async function shot(page, name) {
+            try { await page.screenshot({ path: `/tmp/ss/${name}.png`, fullPage: true }); console.log('shot:' + name); }
+            catch(e) { console.log('shot fail ' + name + ': ' + e.message); }
+          }
+
+          async function tg(msg) {
+            if (!TG_TOKEN || !TG_CHAT_ID) return;
+            try {
+              await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+                method:'POST', headers:{'Content-Type':'application/json'},
+                body: JSON.stringify({ chat_id: TG_CHAT_ID, text: msg, parse_mode:'HTML' })
+              });
+            } catch {}
+          }
+
+          async function cdpClick(page, x, y) {
+            const s = await page.target().createCDPSession();
+            try {
+              await s.send('Input.dispatchMouseEvent', { type:'mouseMoved', x, y, button:'none', buttons:0, modifiers:0, clickCount:0 });
+              await sleep(60);
+              await s.send('Input.dispatchMouseEvent', { type:'mousePressed', x, y, button:'left', buttons:1, modifiers:0, clickCount:1 });
+              await sleep(80);
+              await s.send('Input.dispatchMouseEvent', { type:'mouseReleased', x, y, button:'left', buttons:0, modifiers:0, clickCount:1 });
+            } finally { await s.detach().catch(()=>{}); }
+          }
+
+          async function btnPos(page, label) {
+            return page.evaluate(lbl => {
+              const b = [...document.querySelectorAll('button')]
+                .find(b => b.textContent?.trim().toLowerCase() === lbl);
+              if (!b) return null;
+              const r = b.getBoundingClientRect();
+              return r.width > 0 ? { x: r.left + r.width/2, y: r.top + r.height/2 } : null;
+            }, label);
+          }
+
+          async function clickTurnstile(page) {
+            for (let i = 0; i < 20; i++) {
+              const p = await page.evaluate(() => {
+                for (const s of ['cf-turnstile','[data-sitekey]','.cf-turnstile','iframe[src*="challenges.cloudflare.com"]']) {
+                  const el = document.querySelector(s);
+                  if (el) { const r = el.getBoundingClientRect(); if (r.width>0) return { x: r.left+24, y: r.top+r.height/2 }; }
+                }
+                return null;
+              });
+              if (p) { console.log('Turnstile @ ' + (p.x|0) + ',' + (p.y|0)); await cdpClick(page, p.x, p.y); return true; }
+              await sleep(1000);
+            }
+            return false;
+          }
+
+          async function waitTurnstile(page) {
+            const end = Date.now() + 15000;
+            while (Date.now() < end) {
+              const ok = await page.evaluate(() =>
+                [...document.querySelectorAll('input[name="cf-turnstile-response"],textarea[name="cf-turnstile-response"]')]
+                  .some(i => i.value && i.value.length > 10)
+              ).catch(()=>false);
+              if (ok) return true;
+              for (const f of page.frames()) {
+                if (!f.url().includes('cloudflare')) continue;
+                const t = await f.evaluate(()=>document.body?.innerText||'').catch(()=>'');
+                if (t.includes('Success')) return true;
+              }
+              await sleep(500);
+            }
+            return false;
+          }
+
+          async function getStatus(page) {
+            return page.evaluate(() => {
+              function w(root) {
+                const it = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+                let n;
+                while ((n = it.nextNode())) {
+                  const t = n.textContent.trim().toLowerCase();
+                  if (t==='offline') return 'offline';
+                  if (t==='starting') return 'starting';
+                  if (t==='online'||t==='running') return 'online';
+                }
+                return null;
+              }
+              for (const s of ['.server-status','[class*="status"]','[class*="badge"]','.badge'])
+                for (const el of document.querySelectorAll(s)) { const r=w(el); if(r) return r; }
+              return w(document.body) || 'unknown';
+            });
+          }
+
+          async function doStart(page) {
+            for (let round = 1; round <= 3; round++) {
+              console.log('--- round ' + round + '/3 ---');
+              const sp = await btnPos(page, 'start');
+              if (!sp) { console.log('no start btn'); break; }
+              console.log('click Start @ ' + (sp.x|0) + ',' + (sp.y|0));
+              await cdpClick(page, sp.x, sp.y);
+
+              let adClicked = false;
+              for (let w = 0; w < 10; w++) {
+                await sleep(500);
+                const ap = await btnPos(page, 'watch ad');
+                if (ap) {
+                  await sleep(1000);
+                  const ap2 = await btnPos(page, 'watch ad');
+                  if (ap2) {
+                    await shot(page, 'ad_' + round);
+                    console.log('click Watch Ad @ ' + (ap2.x|0) + ',' + (ap2.y|0));
+                    await cdpClick(page, ap2.x, ap2.y);
+                    adClicked = true;
+                  }
+                  break;
+                }
+              }
+              if (!adClicked) console.log('no ad modal');
+
+              console.log('waiting 30s...');
+              for (let s = 5; s <= 30; s += 5) { await sleep(5000); console.log(s + '/30s'); }
+
+              await page.reload({ waitUntil: 'domcontentloaded' });
+              await sleep(2000);
+              const st = await getStatus(page);
+              console.log('status: ' + st);
+              await shot(page, 'round' + round + '_' + st);
+              if (st === 'starting' || st === 'online') return st;
+              if (round < 3) await sleep(2000);
+            }
+            return await getStatus(page);
+          }
+
+          const { browser, page } = await connect({
+            headless: false, turnstile: false, disableXvfb: false,
+            args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu','--window-size=1280,800'],
+            customConfig: { chromePath: '/usr/bin/google-chrome-stable' },
+            connectOption: { defaultViewport: { width:1280, height:800 }, protocolTimeout: 60000 },
+          });
+          console.log('browser ok');
+
+          try {
+            await page.goto(LOGIN_URL, { waitUntil:'domcontentloaded', timeout:30000 });
+            await sleep(2000);
+            await shot(page, '01_login');
+
+            await page.focus('input[type="email"]'); await sleep(200);
+            for (const c of EMAIL) { await page.keyboard.type(c, { delay: 40+Math.random()*40 }); }
+            await sleep(300);
+            await page.focus('input[type="password"]'); await sleep(200);
+            for (const c of PASSWORD) { await page.keyboard.type(c, { delay: 40+Math.random()*40 }); }
+            await sleep(300);
+            await shot(page, '02_creds');
+
+            const tc = await clickTurnstile(page);
+            if (tc) { const ok = await waitTurnstile(page); console.log(ok?'turnstile ok':'turnstile unconfirmed'); }
+            else console.log('no turnstile found');
+            await shot(page, '03_turnstile');
+
+            const lp = await btnPos(page, 'sign in');
+            if (lp) await cdpClick(page, lp.x, lp.y);
+            else await page.keyboard.press('Enter');
+
+            try { await page.waitForNavigation({ timeout:20000, waitUntil:'domcontentloaded' }); } catch { await sleep(5000); }
+            await shot(page, '04_after_login');
+
+            if (page.url().includes('/auth/login')) {
+              const err = await page.evaluate(()=>[...document.querySelectorAll('.alert,.error,[role="alert"]')].map(e=>e.textContent?.trim()).join('|')).catch(()=>'');
+              console.log('login failed: ' + err);
+              await tg('❌ <b>Falix</b> 登录失败: ' + err);
+              process.exit(1);
+            }
+            console.log('login ok');
+
+            await page.goto(SERVER_URL, { waitUntil:'domcontentloaded', timeout:30000 });
+            await sleep(3000);
+            await shot(page, '05_console');
+
+            const st = await getStatus(page);
+            console.log('status: ' + st);
+
+            if (st === 'starting' || st === 'online') {
+              await tg('✅ <b>Falix</b> 状态 <code>' + st + '</code>，无需操作');
+              console.log('already running');
+            } else {
+              const final = await doStart(page);
+              if (final === 'starting' || final === 'online') {
+                await tg('✅ <b>Falix</b> 启动成功，状态: <code>' + final + '</code>');
+                console.log('start success');
+              } else {
+                await tg('⚠️ <b>Falix</b> 三次后仍为 <code>' + final + '</code>');
+                console.log('still: ' + final);
+              }
+            }
+          } catch(e) {
+            console.error('error: ' + e.message);
+            await shot(page, 'error').catch(()=>{});
+            await tg('❌ <b>Falix</b> 出错: ' + e.message);
+            process.exit(1);
+          } finally {
+            await browser.close().catch(()=>{});
+          }
+          """
+          with open('/home/runner/work/run.mjs', 'w') as f:
+              f.write(script.strip())
+          print('script written ok')
+          PYEOF
+
+      - name: Run script
         env:
           FALIX_EMAIL: ${{ secrets.FALIX_EMAIL }}
           FALIX_PASSWORD: ${{ secrets.FALIX_PASSWORD }}
           FALIX_SERVER_ID: ${{ secrets.FALIX_SERVER_ID }}
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: node - << 'JSEOF'
-import { connect } from 'puppeteer-real-browser';
-import fs from 'fs';
-
-const EMAIL     = process.env.FALIX_EMAIL;
-const PASSWORD  = process.env.FALIX_PASSWORD;
-const SERVER_ID = process.env.FALIX_SERVER_ID;
-const TG_TOKEN  = process.env.TG_TOKEN;
-const TG_CHAT_ID= process.env.TG_CHAT_ID;
-const LOGIN_URL = 'https://client.falixnodes.net/auth/login';
-const SERVER_URL= `https://client.falixnodes.net/server/${SERVER_ID}/console`;
-
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-fs.mkdirSync('/tmp/ss', { recursive: true });
-
-async function shot(page, name) {
-  try { await page.screenshot({ path: `/tmp/ss/${name}.png`, fullPage: true }); console.log(`📸 ${name}`); }
-  catch(e) { console.log(`📸失败 ${name}: ${e.message}`); }
-}
-
-async function tg(msg) {
-  if (!TG_TOKEN || !TG_CHAT_ID) return;
-  try {
-    await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ chat_id: TG_CHAT_ID, text: msg, parse_mode:'HTML' })
-    });
-  } catch {}
-}
-
-// CDP 直接发坐标点击，完全绕过 DOM 可点击性
-async function cdpClick(page, x, y) {
-  const s = await page.target().createCDPSession();
-  try {
-    await s.send('Input.dispatchMouseEvent', { type:'mouseMoved', x, y, button:'none', buttons:0, modifiers:0, clickCount:0 });
-    await sleep(60);
-    await s.send('Input.dispatchMouseEvent', { type:'mousePressed', x, y, button:'left', buttons:1, modifiers:0, clickCount:1 });
-    await sleep(80);
-    await s.send('Input.dispatchMouseEvent', { type:'mouseReleased', x, y, button:'left', buttons:0, modifiers:0, clickCount:1 });
-  } finally { await s.detach().catch(()=>{}); }
-}
-
-// 从 DOM 找按钮中心坐标（纯 evaluate，不返回 handle）
-async function btnPos(page, label) {
-  return page.evaluate(lbl => {
-    const b = [...document.querySelectorAll('button')]
-      .find(b => b.textContent?.trim().toLowerCase() === lbl);
-    if (!b) return null;
-    const r = b.getBoundingClientRect();
-    return r.width > 0 ? { x: r.left + r.width/2, y: r.top + r.height/2 } : null;
-  }, label);
-}
-
-// Turnstile
-async function clickTurnstile(page) {
-  for (let i = 0; i < 20; i++) {
-    const p = await page.evaluate(() => {
-      for (const s of ['cf-turnstile','[data-sitekey]','.cf-turnstile','iframe[src*="challenges.cloudflare.com"]']) {
-        const el = document.querySelector(s);
-        if (el) { const r = el.getBoundingClientRect(); if (r.width>0) return { x: r.left+24, y: r.top+r.height/2 }; }
-      }
-      return null;
-    });
-    if (p) { console.log(`  Turnstile @ (${p.x|0},${p.y|0})`); await cdpClick(page, p.x, p.y); return true; }
-    await sleep(1000);
-  }
-  return false;
-}
-
-async function waitTurnstile(page) {
-  const end = Date.now() + 15000;
-  while (Date.now() < end) {
-    const ok = await page.evaluate(() =>
-      [...document.querySelectorAll('input[name="cf-turnstile-response"],textarea[name="cf-turnstile-response"]')]
-        .some(i => i.value?.length > 10)
-    ).catch(()=>false);
-    if (ok) return true;
-    for (const f of page.frames()) {
-      if (!f.url().includes('cloudflare')) continue;
-      const t = await f.evaluate(()=>document.body?.innerText||'').catch(()=>'');
-      if (t.includes('Success')) return true;
-    }
-    await sleep(500);
-  }
-  return false;
-}
-
-// 状态检测
-async function getStatus(page) {
-  return page.evaluate(() => {
-    function w(root) {
-      const it = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-      let n;
-      while ((n = it.nextNode())) {
-        const t = n.textContent.trim().toLowerCase();
-        if (t==='offline') return 'offline';
-        if (t==='starting') return 'starting';
-        if (t==='online'||t==='running') return 'online';
-      }
-      return null;
-    }
-    for (const s of ['.server-status','[class*="status"]','[class*="badge"]','.badge'])
-      for (const el of document.querySelectorAll(s)) { const r=w(el); if(r) return r; }
-    return w(document.body) || 'unknown';
-  });
-}
-
-// ── 启动逻辑：最多3次，每次等30秒，广告弹窗能点就点，不能点就跳过 ──
-async function doStart(page) {
-  for (let round = 1; round <= 3; round++) {
-    console.log(`\n▶️  第 ${round}/3 次尝试...`);
-
-    // 点 Start
-    const sp = await btnPos(page, 'start');
-    if (!sp) { console.log('  未找到 Start 按钮，停止'); break; }
-    console.log(`  点击 Start @ (${sp.x|0},${sp.y|0})`);
-    await cdpClick(page, sp.x, sp.y);
-
-    // 等最多5秒看广告弹窗出没出来
-    let adClicked = false;
-    for (let w = 0; w < 10; w++) {
-      await sleep(500);
-      const ap = await btnPos(page, 'watch ad');
-      if (ap) {
-        // 等1秒让弹窗动画完成
-        await sleep(1000);
-        // 重取坐标
-        const ap2 = await btnPos(page, 'watch ad');
-        if (ap2) {
-          await shot(page, `ad_modal_${round}`);
-          console.log(`  🎬 Watch Ad @ (${ap2.x|0},${ap2.y|0})`);
-          await cdpClick(page, ap2.x, ap2.y);
-          adClicked = true;
-        }
-        break;
-      }
-    }
-    if (!adClicked) console.log('  ℹ️  无广告弹窗');
-
-    // 统一等30秒
-    console.log('  ⏳ 等 30 秒...');
-    for (let s = 5; s <= 30; s += 5) { await sleep(5000); console.log(`     ${s}/30s`); }
-
-    await page.reload({ waitUntil: 'domcontentloaded' });
-    await sleep(2000);
-
-    const st = await getStatus(page);
-    console.log(`  📊 状态: ${st}`);
-    await shot(page, `round${round}_${st}`);
-
-    if (st === 'starting' || st === 'online') return st;
-    if (round < 3) { console.log('  还没开，再试...'); await sleep(2000); }
-  }
-  return await getStatus(page);
-}
-
-// ── 主 ──
-const { browser, page } = await connect({
-  headless: false, turnstile: false, disableXvfb: false,
-  args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu','--window-size=1280,800'],
-  customConfig: { chromePath: '/usr/bin/google-chrome-stable' },
-  connectOption: { defaultViewport: { width:1280, height:800 }, protocolTimeout: 60000 },
-});
-console.log('✅ 浏览器启动');
-
-try {
-  await page.goto(LOGIN_URL, { waitUntil:'domcontentloaded', timeout:30000 });
-  await sleep(2000);
-  await shot(page, '01_login');
-
-  // 填邮箱密码
-  await page.focus('input[name="email"],input[type="email"]'); await sleep(200);
-  for (const c of EMAIL) { await page.keyboard.type(c, { delay: 40+Math.random()*40 }); }
-  await sleep(300);
-  await page.focus('input[name="password"],input[type="password"]'); await sleep(200);
-  for (const c of PASSWORD) { await page.keyboard.type(c, { delay: 40+Math.random()*40 }); }
-  await sleep(300);
-  await shot(page, '02_creds');
-
-  // Turnstile
-  const tc = await clickTurnstile(page);
-  if (tc) { const ok = await waitTurnstile(page); console.log(ok?'✅ Turnstile':'⚠️  Turnstile未确认'); }
-  else console.log('⚠️  未找到Turnstile');
-  await shot(page, '03_turnstile');
-
-  // 登录
-  const lp = await btnPos(page, 'sign in');
-  if (lp) await cdpClick(page, lp.x, lp.y);
-  else await page.keyboard.press('Enter');
-
-  try { await page.waitForNavigation({ timeout:20000, waitUntil:'domcontentloaded' }); } catch { await sleep(5000); }
-
-  await shot(page, '04_after_login');
-  if (page.url().includes('/auth/login')) {
-    const err = await page.evaluate(()=>[...document.querySelectorAll('.alert,.error,[role="alert"]')].map(e=>e.textContent?.trim()).join(' | ')).catch(()=>'');
-    console.log('❌ 登录失败:', err);
-    await tg(`❌ <b>Falix</b> 登录失败: ${err}`);
-    process.exit(1);
-  }
-  console.log('✅ 登录成功');
-
-  // 跳转控制台
-  await page.goto(SERVER_URL, { waitUntil:'domcontentloaded', timeout:30000 });
-  await sleep(3000);
-  await shot(page, '05_console');
-
-  const st = await getStatus(page);
-  console.log(`📊 当前状态: ${st}`);
-
-  if (st === 'starting' || st === 'online') {
-    await tg(`✅ <b>Falix</b> 状态 <code>${st}</code>，无需操作`);
-    console.log('✅ 无需操作');
-  } else {
-    const final = await doStart(page);
-    if (final === 'starting' || final === 'online') {
-      await tg(`✅ <b>Falix</b> 启动成功，状态: <code>${final}</code>`);
-      console.log('✅ 启动成功');
-    } else {
-      await tg(`⚠️ <b>Falix</b> 三次后仍为 <code>${final}</code>`);
-      console.log(`⚠️  三次后仍为: ${final}`);
-    }
-  }
-} catch(e) {
-  console.error('❌', e.message);
-  await shot(page, 'error').catch(()=>{});
-  await tg(`❌ <b>Falix</b> 出错: ${e.message}`);
-  process.exit(1);
-} finally {
-  await browser.close().catch(()=>{});
-}
-JSEOF
+        run: node /home/runner/work/run.mjs
 
       - name: Upload screenshots
         if: always()
